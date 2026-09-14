@@ -1,9 +1,15 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+# Load environment variables (.env) before service initialization
+load_dotenv()
+
 from app.websocket import transcription_websocket
+from app.routes.medical import router as medical_router
 
 app = FastAPI(
-    title="Medical Live Transcription API",
+    title="Medical Live Transcription & Clinical Summary API",
     version="1.0.0",
 )
 
@@ -17,6 +23,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount REST endpoints
+app.include_router(medical_router)
 
 @app.get("/health")
 async def health_check():

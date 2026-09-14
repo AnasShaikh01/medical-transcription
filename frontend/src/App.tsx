@@ -4,6 +4,7 @@ import { RecordingPanel } from './components/RecordingPanel';
 import { MedicalSummary } from './components/MedicalSummary';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
 import { useTranscription } from './hooks/useTranscription';
+import { extractMedicalSummary, normalizeMedicalTranscript } from './services/api';
 import type { TranscriptItem } from './types/transcript';
 import type { MedicalSummaryData } from './types/medical';
 import { Activity, Radio, FileQuestion } from 'lucide-react';
@@ -12,19 +13,19 @@ const DEMO_TRANSCRIPT_ITEMS: TranscriptItem[] = [
   {
     id: 'demo-1',
     speaker: 'Doctor',
-    text: 'Good morning John. What brings you in today?',
+    text: 'Good morning John. You are a 32-year-old male, correct?',
     timestamp: '10:00 AM',
   },
   {
     id: 'demo-2',
     speaker: 'Patient',
-    text: "I've been having a severe throbbing headache on the right side of my head for the past three days.",
+    text: "Yes. I've been having a severe throbbing headache on the right side of my head for the past three days.",
     timestamp: '10:01 AM',
   },
   {
     id: 'demo-3',
     speaker: 'Doctor',
-    text: 'Are you having any nausea, fever, or sensitivity to light?',
+    text: 'Are you having any nausea, fever, neck stiffness, or sensitivity to light?',
     timestamp: '10:01 AM',
   },
   {
@@ -36,14 +37,20 @@ const DEMO_TRANSCRIPT_ITEMS: TranscriptItem[] = [
   {
     id: 'demo-5',
     speaker: 'Doctor',
-    text: 'Your blood pressure is 122 over 80 and neurological exam is normal. Are you taking any medications?',
+    text: 'Your blood pressure is 122 over 80 and neurological exam is normal. Are you currently taking any medications?',
     timestamp: '10:03 AM',
   },
   {
     id: 'demo-6',
     speaker: 'Patient',
-    text: 'I took Paracetamol 650 twice yesterday, but it did not provide much relief. I have no known drug allergies.',
+    text: 'I took Paracetamol 650mg twice yesterday, but it did not provide much relief. I have no known drug allergies.',
     timestamp: '10:03 AM',
+  },
+  {
+    id: 'demo-7',
+    speaker: 'Doctor',
+    text: 'Assessment is acute migraine without aura. I will prescribe Sumatriptan 50mg for acute episodes. Rest in a dark quiet room, maintain hydration, and follow up in two weeks if symptoms persist.',
+    timestamp: '10:04 AM',
   },
 ];
 
@@ -52,11 +59,11 @@ export default function App() {
   const [summary, setSummary] = useState<MedicalSummaryData | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
 
-  // Real-time Whisper transcript callback
+  // Live Whisper transcript callback
   const handleNewTranscript = useCallback((text: string) => {
     const now = new Date();
     const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    
+
     const newItem: TranscriptItem = {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       speaker: 'Live Transcript',
@@ -104,52 +111,71 @@ export default function App() {
 
   const handleStart = async () => {
     try {
-      // 1. Ensure WebSocket handshake completes first
       await connect();
-      // 2. Start capturing microphone only after socket is OPEN
       await startRecording();
     } catch (err) {
-      console.error('Failed to connect WebSocket before starting recorder:', err);
+      console.error('Failed to start recording session:', err);
     }
   };
 
   const handleStop = async () => {
-    // 1. Await full audio hardware & worklet shutdown
     await stopRecording();
-
-    // 2. Now safe to finalize: no subsequent audio frames will be emitted
     sendControlMessage({ action: 'finalize' });
-
-    // 3. Grace window for the backend to run inference on leftover buffer & return text
     setTimeout(() => {
       disconnect();
-    }, 700);
+    }, 600);
   };
 
-  const handleClear = () => {
-    clearRecording();
+  const handleClear = async () => {
+    await clearRecording();
     disconnect();
     setTranscripts([]);
+    setSummary(null);
   };
 
   const handleLoadDemo = () => {
     setTranscripts(DEMO_TRANSCRIPT_ITEMS);
   };
 
-  const handleProcessTranscript = () => {
+  // Phase 6: Trigger Groq clinical extraction
+  // Two-tier processing: Normalization -> Clinical Schema Extraction
+  const handleProcessTranscript = async () => {
+    if (transcripts.length === 0) {
+      alert('Transcript is empty. Record consultation audio or click "Load Demo Consultation" first.');
+      return;
+    }
+
+    setSummary(null);
     setIsProcessing(true);
-    // Placeholder until Phase 6 Groq extraction is hooked up
-    setTimeout(() => {
-      alert('Whisper transcript captured! Next step will send this transcript to Groq LLM for clinical extraction.');
+
+    try {
+      const rawTranscript = transcripts
+        .map((item) => `${item.speaker}: ${item.text}`)
+        .join('\n');
+
+      // Step 1: Fix phonetic and ASR domain errors via constrained LLM normalizer
+      const normalizedTranscript = await normalizeMedicalTranscript(rawTranscript);
+
+      console.log('--- [PIPELINE AUDIT] ---');
+      console.log('RAW TRANSCRIPT:\n', rawTranscript);
+      console.log('NORMALIZED TRANSCRIPT:\n', normalizedTranscript);
+
+      // Step 2: Extract medical data using structured Pydantic schema
+      const extractedData = await extractMedicalSummary(normalizedTranscript);
+      setSummary(extractedData);
+    } catch (error) {
+      console.error('Medical processing failed:', error);
+      alert('Failed to process consultation. Please verify backend server status and GROQ_API_KEY.');
+    } finally {
       setIsProcessing(false);
-    }, 800);
+    }
   };
 
   const handleClearSummary = () => setSummary(null);
 
   const handleCopySummary = () => {
     if (!summary) return;
-    const text = `PATIENT: ${summary.patient_details.name} (Age: ${summary.patient_details.age}, Sex: ${summary.patient_details.sex})\nCHIEF COMPLAINT: ${summary.chief_complaint}\nASSESSMENT: ${summary.assessment}\nPLAN: ${summary.plan.join(', ')}`;
+    const text = `PATIENT: ${summary.patient_details.name} (Age: ${summary.patient_details.age}, Sex: ${summary.patient_details.sex})\nCHIEF COMPLAINT: ${summary.chief_complaint}\nHPI: ${summary.history_of_present_illness}\nPOSITIVE SYMPTOMS: ${summary.symptoms.positive.join(', ')}\nPERTINENT NEGATIVES: ${summary.symptoms.negative.join(', ')}\nMEDICATIONS: ${summary.medication_history.join(', ')}\nASSESSMENT: ${summary.assessment}\nPLAN: ${summary.plan.join(', ')}`;
     navigator.clipboard.writeText(text);
     alert('Medical summary copied to clipboard!');
   };

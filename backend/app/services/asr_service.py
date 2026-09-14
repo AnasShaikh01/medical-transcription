@@ -2,31 +2,55 @@ import numpy as np
 from faster_whisper import WhisperModel
 import asyncio
 
+# Comprehensive clinical domain bias prompt
+DEFAULT_MEDICAL_PROMPT = (
+    "Clinical doctor-patient consultation dialogue discussing symptoms, examination findings, "
+    "diagnoses, vital signs, and prescription management. Common clinical terms include: "
+    "paracetamol, sumatriptan, amoxicillin, cetirizine, metformin, atorvastatin, ibuprofen, "
+    "mg, milligrams, blood pressure, mmHg, hypertension, acute migraine, photophobia, nausea, "
+    "fever, neck stiffness, throbbing headache, sputum, persistent cough, dyspnea, shortness of breath, "
+    "asthma, wheezing, inhaler, allergy, no known drug allergies, NKDA, negative for chest pain."
+)
+
 class ASRService:
-    def __init__(self, model_size: str = "base.en", device: str = "cpu", compute_type: str = "int8"):
+    def __init__(
+        self,
+        model_size: str = "base.en",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        medical_prompt: str = DEFAULT_MEDICAL_PROMPT,
+    ):
         """
-        Loads the faster-whisper model once at application startup.
-        Runs locally on CPU with int8 quantization for ultra-fast, zero-cost inference.
+        Loads faster-whisper on CPU with int8 quantization.
+        Applies clinical vocabulary biasing via initial_prompt.
         """
-        print(f"[ASR] Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type, cpu_threads=4)
-        print("[ASR] faster-whisper model successfully loaded.")
+        print(f"[ASR] Loading faster-whisper '{model_size}' on {device.upper()} ({compute_type})...")
+        self.model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=4,
+        )
+        self.medical_prompt = medical_prompt
+        print(f"[ASR] faster-whisper model '{model_size}' loaded with medical prompt priming.")
 
     def transcribe(self, audio_np: np.ndarray) -> dict:
         """
-        Transcribes a 1D NumPy float32 audio array (16kHz).
-        Returns full text and recognized segments.
+        Transcribes 1D float32 audio (16kHz).
+        Biased toward clinical terms using initial_prompt with temperature=0 for determinism.
         """
         if len(audio_np) == 0:
             return {"text": "", "language": "en", "segments": []}
 
-        # Whisper expects float32 normalized between -1.0 and 1.0
         segments, info = self.model.transcribe(
             audio_np,
-            beam_size=3,
             language="en",
-            condition_on_previous_text=False,
-            vad_filter=False,  # We already handled VAD with Silero
+            beam_size=5,
+            best_of=5,
+            temperature=0.0,
+            initial_prompt=self.medical_prompt,  # 🎯 Injects domain vocabulary into Whisper decoder
+            condition_on_previous_text=False,     # Prevents repeating phrases between buffered chunks
+            vad_filter=False,                     # Handled upstream by Silero VAD
         )
 
         segment_list = []
@@ -49,5 +73,5 @@ class ASRService:
         }
 
     async def transcribe_async(self, audio_np: np.ndarray) -> dict:
-        """Run CPU inference in an asyncio threadpool to avoid blocking WebSocket loop."""
+        """Runs inference in an asyncio threadpool to avoid blocking WebSocket frames."""
         return await asyncio.to_thread(self.transcribe, audio_np)
