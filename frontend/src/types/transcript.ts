@@ -1,6 +1,8 @@
+export type SpeakerType = 'Doctor' | 'Patient' | 'System' | 'Live Transcript';
+
 export interface TranscriptItem {
   id: string;
-  speaker: 'Doctor' | 'Patient' | 'System';
+  speaker: SpeakerType;
   text: string;
   timestamp: string;
 }

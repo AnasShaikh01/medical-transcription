@@ -1,78 +1,91 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { Header } from './components/Header';
 import { RecordingPanel } from './components/RecordingPanel';
 import { MedicalSummary } from './components/MedicalSummary';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
+import { useTranscription } from './hooks/useTranscription';
 import type { TranscriptItem } from './types/transcript';
 import type { MedicalSummaryData } from './types/medical';
+import { Activity, Radio, FileQuestion } from 'lucide-react';
 
-const DUMMY_TRANSCRIPTS: TranscriptItem[] = [
+const DEMO_TRANSCRIPT_ITEMS: TranscriptItem[] = [
   {
-    id: '1',
+    id: 'demo-1',
     speaker: 'Doctor',
     text: 'Good morning John. What brings you in today?',
     timestamp: '10:00 AM',
   },
   {
-    id: '2',
+    id: 'demo-2',
     speaker: 'Patient',
-    text: "I've been experiencing a severe throbbing headache for the past three days.",
+    text: "I've been having a severe throbbing headache on the right side of my head for the past three days.",
     timestamp: '10:01 AM',
   },
   {
-    id: '3',
+    id: 'demo-3',
     speaker: 'Doctor',
-    text: 'Are you having any nausea, fever, or vision changes?',
+    text: 'Are you having any nausea, fever, or sensitivity to light?',
     timestamp: '10:01 AM',
   },
   {
-    id: '4',
+    id: 'demo-4',
     speaker: 'Patient',
-    text: 'Yes, mild nausea and sensitivity to light. No fever or neck stiffness though.',
+    text: 'Yes, I feel nauseous and bright light hurts my eyes. But definitely no fever and no neck stiffness.',
     timestamp: '10:02 AM',
   },
   {
-    id: '5',
+    id: 'demo-5',
     speaker: 'Doctor',
-    text: 'Blood pressure is 120 over 80. Pupils are equal and reactive. Are you taking any medications?',
+    text: 'Your blood pressure is 122 over 80 and neurological exam is normal. Are you taking any medications?',
     timestamp: '10:03 AM',
   },
   {
-    id: '6',
+    id: 'demo-6',
     speaker: 'Patient',
-    text: 'Just Paracetamol 650 occasionally, but it barely helps.',
+    text: 'I took Paracetamol 650 twice yesterday, but it did not provide much relief. I have no known drug allergies.',
     timestamp: '10:03 AM',
   },
 ];
 
-const DUMMY_SUMMARY: MedicalSummaryData = {
-  patient_details: {
-    name: 'John Doe',
-    age: 32,
-    sex: 'Male',
-  },
-  chief_complaint: 'Severe throbbing headache for 3 days.',
-  history_of_present_illness:
-    'Patient reports onset of moderate to severe throbbing headache 3 days ago. Aggravated by light. Partial relief with rest.',
-  symptoms: {
-    positive: ['Severe headache', 'Nausea', 'Photophobia'],
-    negative: ['Fever', 'Neck stiffness', 'Vision changes'],
-  },
-  past_medical_history: [],
-  medication_history: ['Paracetamol 650mg occasionally (minimal relief)'],
-  clinical_observations: [
-    'BP: 120/80 mmHg',
-    'Pupillary reflexes normal',
-  ],
-  assessment: 'Migraine without aura (provisional)',
-  plan: [
-    'Prescribe Sumatriptan 50mg for acute episodes',
-    'Rest in dark room, maintain hydration',
-    'Follow up in 2 weeks if symptoms persist',
-  ],
-};
-
 export default function App() {
+  const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
+  const [summary, setSummary] = useState<MedicalSummaryData | null>(null);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+
+  // Real-time Whisper transcript callback
+  const handleNewTranscript = useCallback((text: string) => {
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    const newItem: TranscriptItem = {
+      id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      speaker: 'Live Transcript',
+      text,
+      timestamp: timeStr,
+    };
+
+    setTranscripts((prev) => [...prev, newItem]);
+  }, []);
+
+  const {
+    isConnected,
+    totalChunks,
+    speechChunks,
+    isSpeechDetected,
+    speechProbability,
+    connect,
+    sendAudioChunk,
+    sendControlMessage,
+    disconnect,
+  } = useTranscription(handleNewTranscript);
+
+  const handlePCMChunk = useCallback(
+    (chunk: Float32Array) => {
+      sendAudioChunk(chunk);
+    },
+    [sendAudioChunk]
+  );
+
   const {
     isRecording,
     audioChunks,
@@ -81,31 +94,55 @@ export default function App() {
     stopRecording,
     clearRecording,
     downloadRecording,
-  } = useAudioRecorder();
+  } = useAudioRecorder(handlePCMChunk);
 
-  const [transcripts, setTranscripts] = useState<TranscriptItem[]>(DUMMY_TRANSCRIPTS);
-  const [summary, setSummary] = useState<MedicalSummaryData | null>(DUMMY_SUMMARY);
-  const [isProcessing, setIsProcessing] = useState<boolean>(false);
-
-  // Compute stats: words from transcript, chunks directly from audio chunk stream
   const wordCount = transcripts.reduce(
     (acc, curr) => acc + (curr.text.trim() ? curr.text.trim().split(/\s+/).length : 0),
     0
   );
-  // Real chunk count if recording, or transcript-based if idle with dummy items
-  const chunkCount = audioChunks.length;
+  const chunkCount = totalChunks > 0 ? totalChunks : audioChunks.length;
+
+  const handleStart = async () => {
+    try {
+      // 1. Ensure WebSocket handshake completes first
+      await connect();
+      // 2. Start capturing microphone only after socket is OPEN
+      await startRecording();
+    } catch (err) {
+      console.error('Failed to connect WebSocket before starting recorder:', err);
+    }
+  };
+
+  const handleStop = async () => {
+    // 1. Await full audio hardware & worklet shutdown
+    await stopRecording();
+
+    // 2. Now safe to finalize: no subsequent audio frames will be emitted
+    sendControlMessage({ action: 'finalize' });
+
+    // 3. Grace window for the backend to run inference on leftover buffer & return text
+    setTimeout(() => {
+      disconnect();
+    }, 700);
+  };
 
   const handleClear = () => {
     clearRecording();
+    disconnect();
     setTranscripts([]);
+  };
+
+  const handleLoadDemo = () => {
+    setTranscripts(DEMO_TRANSCRIPT_ITEMS);
   };
 
   const handleProcessTranscript = () => {
     setIsProcessing(true);
+    // Placeholder until Phase 6 Groq extraction is hooked up
     setTimeout(() => {
-      setSummary(DUMMY_SUMMARY);
+      alert('Whisper transcript captured! Next step will send this transcript to Groq LLM for clinical extraction.');
       setIsProcessing(false);
-    }, 1000);
+    }, 800);
   };
 
   const handleClearSummary = () => setSummary(null);
@@ -124,13 +161,71 @@ export default function App() {
       {/* Mic Permission / Device Error Banner */}
       {micError && (
         <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-10 pt-4">
-          <div className="p-3.5 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-center justify-between">
+          <div className="p-3.5 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-center justify-between shadow-xs">
             <span>⚠️ {micError}</span>
           </div>
         </div>
       )}
 
-      <main className="flex-1 w-full px-4 sm:px-6 lg:px-10 py-6 max-w-[1600px] mx-auto">
+      {/* Real-time Silero VAD Telemetry Banner */}
+      <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-10 pt-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 text-xs bg-white border border-slate-200/90 px-4 py-2 rounded-xl shadow-xs">
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Connection status */}
+            <div className="flex items-center gap-1.5 font-medium">
+              <Radio className={`w-3.5 h-3.5 ${isConnected ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}`} />
+              <span>WebSocket:</span>
+              <strong className={isConnected ? 'text-emerald-600 font-semibold' : 'text-slate-500'}>
+                {isConnected ? 'Connected' : 'Disconnected'}
+              </strong>
+            </div>
+
+            <span className="text-slate-200">|</span>
+
+            {/* VAD status indicator */}
+            <div className="flex items-center gap-1.5 font-medium">
+              <Activity className={`w-3.5 h-3.5 ${isSpeechDetected ? 'text-indigo-600 animate-bounce' : 'text-slate-400'}`} />
+              <span>Silero VAD:</span>
+              <span
+                className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                  isSpeechDetected
+                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                    : 'bg-slate-100 text-slate-500 border border-slate-200'
+                }`}
+              >
+                {isSpeechDetected ? 'SPEECH DETECTED' : 'SILENCE / NOISE'}
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono">
+                ({Math.round(speechProbability * 100)}%)
+              </span>
+            </div>
+
+            <span className="text-slate-200">|</span>
+
+            {/* Chunks Statistics */}
+            <div className="flex items-center gap-2 text-[11px] text-slate-600">
+              <span>
+                Total: <strong className="font-mono text-slate-900">{totalChunks}</strong>
+              </span>
+              <span>•</span>
+              <span>
+                Speech: <strong className="font-mono text-emerald-600">{speechChunks}</strong>
+              </span>
+            </div>
+          </div>
+
+          {/* Quick Demo Loader */}
+          <button
+            onClick={handleLoadDemo}
+            className="flex items-center gap-1.5 text-xs text-indigo-600 hover:text-indigo-800 font-semibold cursor-pointer"
+          >
+            <FileQuestion className="w-3.5 h-3.5" />
+            <span>Load Demo Consultation</span>
+          </button>
+        </div>
+      </div>
+
+      <main className="flex-1 w-full px-4 sm:px-6 lg:px-10 py-5 max-w-[1600px] mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
           {/* Left: Live Transcription Panel */}
           <RecordingPanel
@@ -138,8 +233,8 @@ export default function App() {
             transcripts={transcripts}
             wordCount={wordCount}
             chunkCount={chunkCount}
-            onStart={startRecording}
-            onStop={stopRecording}
+            onStart={handleStart}
+            onStop={handleStop}
             onClear={handleClear}
             onSave={() => downloadRecording()}
             onProcess={handleProcessTranscript}

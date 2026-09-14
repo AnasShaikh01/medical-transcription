@@ -11,7 +11,7 @@ export interface UseAudioRecorderReturn {
   audioChunks: Blob[];
   error: string | null;
   startRecording: () => Promise<void>;
-  stopRecording: () => void;
-  clearRecording: () => void;
+  stopRecording: () => Promise<void>;
+  clearRecording: () => Promise<void>;
   downloadRecording: (filename?: string) => void;
 }

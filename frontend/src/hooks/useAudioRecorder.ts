@@ -1,7 +1,9 @@
 import { useState, useRef, useCallback } from 'react';
 import type { UseAudioRecorderReturn } from '../types/audio';
 
-export const useAudioRecorder = (): UseAudioRecorderReturn => {
+export const useAudioRecorder = (
+  onPCMData?: (data: Float32Array) => void
+): UseAudioRecorderReturn => {
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
@@ -11,6 +13,11 @@ export const useAudioRecorder = (): UseAudioRecorderReturn => {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const mimeTypeRef = useRef<string>('audio/webm');
+
+  // Web Audio API refs for PCM worklet streaming
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
 
   const startRecording = useCallback(async () => {
     setError(null);
@@ -26,6 +33,7 @@ export const useAudioRecorder = (): UseAudioRecorderReturn => {
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
         },
       });
 
@@ -34,7 +42,7 @@ export const useAudioRecorder = (): UseAudioRecorderReturn => {
       setAudioChunks([]);
       setAudioBlob(null);
 
-      // Detect optimal supported format
+      // --- 1. Path A: MediaRecorder (Local Save / Download) ---
       let mimeType = 'audio/webm';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
         mimeType = 'audio/webm;codecs=opus';
@@ -56,15 +64,34 @@ export const useAudioRecorder = (): UseAudioRecorderReturn => {
       mediaRecorder.onstop = () => {
         const finalBlob = new Blob(chunksRef.current, { type: mimeTypeRef.current });
         setAudioBlob(finalBlob);
-
-        if (mediaStreamRef.current) {
-          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-          mediaStreamRef.current = null;
-        }
-        setIsRecording(false);
       };
 
       mediaRecorder.start(500);
+
+      // --- 2. Path B: 16kHz AudioContext + AudioWorklet (PCM for Silero VAD) ---
+      const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({
+        sampleRate: 16000,
+      });
+      audioContextRef.current = audioCtx;
+
+      // Load processor from public/pcm-processor.js
+      await audioCtx.audioWorklet.addModule('/pcm-processor.js');
+
+      const sourceNode = audioCtx.createMediaStreamSource(stream);
+      sourceNodeRef.current = sourceNode;
+
+      const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+      workletNodeRef.current = workletNode;
+
+      workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        if (event.data && onPCMData) {
+          // Send Float32Array directly (implements ArrayBufferView)
+          onPCMData(event.data);
+        }
+      };
+
+      sourceNode.connect(workletNode);
+
       setIsRecording(true);
     } catch (err: unknown) {
       if (err instanceof DOMException) {
@@ -80,28 +107,48 @@ export const useAudioRecorder = (): UseAudioRecorderReturn => {
       }
       setIsRecording(false);
     }
-  }, []);
+  }, [onPCMData]);
 
-  const stopRecording = useCallback(() => {
+  const stopRecording = useCallback(async (): Promise<void> => {
+    // 1. Stop MediaRecorder if running
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
     }
-  }, []);
 
-  const clearRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+    // 2. Disconnect nodes so no further postMessage callbacks fire
+    if (workletNodeRef.current) {
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
+
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+
+    // 3. Await AudioContext closure so all audio processing hardware clocks halt
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    // 4. Release microphone tracks
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
+
+    setIsRecording(false);
+  }, []);
+
+  const clearRecording = useCallback(async (): Promise<void> => {
+    await stopRecording();
     chunksRef.current = [];
     setAudioChunks([]);
     setAudioBlob(null);
     setError(null);
-    setIsRecording(false);
-  }, []);
+  }, [stopRecording]);
 
   const downloadRecording = useCallback((customFilename?: string) => {
     const currentMime = mimeTypeRef.current;
