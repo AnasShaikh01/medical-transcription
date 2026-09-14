@@ -4,7 +4,7 @@ import {
   type WebSocketMessage,
 } from '../services/websocket';
 
-export const useTranscription = (onTranscriptReceived?: (text: string) => void) => {
+export const useTranscription = (onUtteranceReceived?: (text: string) => void) => {
   const websocketRef = useRef<TranscriptionWebSocket | null>(null);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [totalChunks, setTotalChunks] = useState<number>(0);
@@ -39,37 +39,45 @@ export const useTranscription = (onTranscriptReceived?: (text: string) => void) 
             setSpeechProbability(message.probability);
           }
         }
-        if (message.type === 'transcript' && message.text) {
-          onTranscriptReceived?.(message.text);
+        // Backend commits natural utterance boundary
+        if ((message.type === 'utterance' || message.type === 'transcript') && message.text) {
+          onUtteranceReceived?.(message.text);
         }
       },
-      () => {
-        setIsConnected(false);
-      },
+      () => setIsConnected(false),
       () => {
         setIsConnected(false);
         websocketRef.current = null;
       }
     );
-  }, [onTranscriptReceived]);
+  }, [onUtteranceReceived]);
 
   const sendAudioChunk = useCallback((chunk: Float32Array | Blob | ArrayBuffer) => {
     websocketRef.current?.sendAudioChunk(chunk);
   }, []);
 
-  const sendControlMessage = useCallback((message: Record<string, unknown>) => {
-    websocketRef.current?.sendControlMessage(message);
+  const finalizeAndStop = useCallback(async () => {
+    if (websocketRef.current) {
+      await websocketRef.current.finalizeAndClose();
+      websocketRef.current = null;
+    }
+    setIsConnected(false);
+    setIsSpeechDetected(false);
+  }, []);
+
+  const resetTelemetry = useCallback(() => {
+    setTotalChunks(0);
+    setSpeechChunks(0);
+    setIsSpeechDetected(false);
+    setSpeechProbability(0);
   }, []);
 
   const disconnect = useCallback(() => {
     websocketRef.current?.disconnect();
     websocketRef.current = null;
     setIsConnected(false);
-    setTotalChunks(0);
-    setSpeechChunks(0);
-    setIsSpeechDetected(false);
-    setSpeechProbability(0);
-  }, []);
+    resetTelemetry();
+  }, [resetTelemetry]);
 
   return {
     isConnected,
@@ -79,7 +87,8 @@ export const useTranscription = (onTranscriptReceived?: (text: string) => void) 
     speechProbability,
     connect,
     sendAudioChunk,
-    sendControlMessage,
+    finalizeAndStop,
     disconnect,
+    resetTelemetry,
   };
 };

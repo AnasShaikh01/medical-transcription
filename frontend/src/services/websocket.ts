@@ -12,6 +12,7 @@ export type WebSocketMessage = {
 
 export class TranscriptionWebSocket {
   private socket: WebSocket | null = null;
+  private finalizeResolver: (() => void) | null = null;
 
   connect(
     onMessage: (message: WebSocketMessage) => void,
@@ -19,20 +20,30 @@ export class TranscriptionWebSocket {
     onClose?: () => void
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      const rawWsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
-      const wsUrl = `${rawWsUrl.replace(/\/$/, '')}/ws/transcribe`;
+      let hasSettled = false;
+
+      const rawWsUrl = import.meta.env.VITE_WS_URL || 'http://localhost:8000';
+      const wsUrl = `${rawWsUrl.replace(/^http/, 'ws').replace(/\/$/, '')}/ws/transcribe`;
 
       this.socket = new WebSocket(wsUrl);
       this.socket.binaryType = 'arraybuffer';
 
       this.socket.onopen = () => {
-        console.log('WebSocket connected to:', wsUrl);
-        resolve();
+        if (!hasSettled) {
+          hasSettled = true;
+          resolve();
+        }
       };
 
       this.socket.onmessage = (event) => {
         try {
           const message: WebSocketMessage = JSON.parse(event.data);
+
+          if (message.type === 'finalized' && this.finalizeResolver) {
+            this.finalizeResolver();
+            this.finalizeResolver = null;
+          }
+
           onMessage(message);
         } catch (error) {
           console.error('Invalid WebSocket message:', error);
@@ -40,13 +51,22 @@ export class TranscriptionWebSocket {
       };
 
       this.socket.onerror = () => {
-        console.error('WebSocket connection error');
         onError?.();
-        reject(new Error('WebSocket connection failed'));
+        if (!hasSettled) {
+          hasSettled = true;
+          reject(new Error('WebSocket connection failed'));
+        }
       };
 
       this.socket.onclose = () => {
-        console.log('WebSocket connection closed');
+        if (this.finalizeResolver) {
+          this.finalizeResolver();
+          this.finalizeResolver = null;
+        }
+        if (!hasSettled) {
+          hasSettled = true;
+          reject(new Error('WebSocket closed before connection was established'));
+        }
         onClose?.();
       };
     });
@@ -64,15 +84,33 @@ export class TranscriptionWebSocket {
     }
   }
 
-  sendControlMessage(message: Record<string, unknown>) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    this.socket.send(JSON.stringify(message));
+  finalizeAndClose(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        this.disconnect();
+        resolve();
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        this.disconnect();
+        resolve();
+      }, 1500);
+
+      this.finalizeResolver = () => {
+        clearTimeout(timeoutId);
+        this.disconnect();
+        resolve();
+      };
+
+      this.socket.send(JSON.stringify({ action: 'finalize' }));
+    });
   }
 
   disconnect() {
     if (this.socket) {
+      this.socket.onclose = null;
+      this.socket.onerror = null;
       this.socket.close();
       this.socket = null;
     }
